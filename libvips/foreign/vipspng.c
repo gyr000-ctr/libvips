@@ -1501,6 +1501,31 @@ typedef struct {
 	int page_height;
 	int *delays;
 	int delay_length;
+
+	/* Inter-frame diff state. We stream frames top to bottom, keeping
+	 * only two frame-sized buffers: the previous frame as presented on
+	 * the canvas, and an accumulation buffer for the frame being read.
+	 * At each frame boundary the finished frame is copied over the
+	 * previous one, so the encoder never has the whole animation in
+	 * memory.
+	 */
+	VipsPel *apng_prev;		/* previous frame, frame_size bytes */
+	VipsPel *apng_cur;		/* frame being read, frame_size bytes */
+	size_t apng_frame_size;	/* bytes in one frame */
+	int apng_line_stride;	/* bytes in one full-width row */
+	int apng_pel_size;		/* bytes in one pixel */
+
+	/* Bounding box (in frame coordinates) of pixels which differ from
+	 * the previous frame.
+	 */
+	gboolean apng_any_change;
+	int apng_min_x, apng_max_x;
+	int apng_min_y, apng_max_y;
+
+	/* Set when VIPS_PNG_APNG_NODELTA is in the environment: fall back to
+	 * the old behaviour of writing every frame as the full canvas.
+	 */
+	gboolean apng_no_delta;
 #endif /*PNG_APNG_SUPPORTED*/
 } Write;
 
@@ -1515,6 +1540,16 @@ write_destroy(Write *write)
 	if (write->pPng)
 		png_destroy_write_struct(&write->pPng, &write->pInfo);
 	VIPS_FREE(write->row_pointer);
+
+#ifdef PNG_APNG_SUPPORTED
+	/* These are tracked so the allocation is visible to
+	 * vips_tracked_get_mem() and friends.
+	 */
+	if (write->apng_prev)
+		vips_tracked_free(write->apng_prev);
+	if (write->apng_cur)
+		vips_tracked_free(write->apng_cur);
+#endif /*PNG_APNG_SUPPORTED*/
 
 	VIPS_FREE(write);
 }
@@ -1602,49 +1637,219 @@ write_png_block(VipsRegion *region, VipsRect *area, void *a)
 }
 
 #ifdef PNG_APNG_SUPPORTED
-/* As write_png_block(), but for animated writes: open and close frames as
- * we pass frame boundaries.
+/* Emit one APNG frame. frame_no selects the delay; rect (in frame
+ * coordinates) and data describe the pixels. A frame always covers at least
+ * one pixel: an identical frame is written as a 1x1 SOURCE rectangle copied
+ * from its own top-left, which changes nothing on the canvas but keeps frame
+ * count, ordering and delay semantics intact.
+ *
+ * We only ever use DISPOSE_OP_NONE + BLEND_OP_SOURCE: every frame we emit
+ * is an exact replacement of the changed rectangle in the rendered output,
+ * so decoders (and our own pngload path) reproduce the input pixels without
+ * relying on the integer rounding of alpha compositing.
+ */
+static int
+write_apng_emit_frame(Write *write, int frame_no,
+	const VipsPel *data, int x, int y, int width, int height)
+{
+	int delay = frame_no >= write->delay_length ? 0 :
+		VIPS_CLIP(0, write->delays[frame_no], 65535);
+
+	g_assert(width > 0 && height > 0);
+
+	png_write_frame_head(write->pPng, write->pInfo, NULL,
+		width, height, x, y,
+		delay, 1000,
+		PNG_fcTL_DISPOSE_OP_NONE,
+		PNG_fcTL_BLEND_OP_SOURCE);
+
+	for (int row = 0; row < height; row++)
+		png_write_row(write->pPng,
+			(png_bytep) (data +
+				(gsize) (y + row) * write->apng_line_stride +
+				(gsize) x * write->apng_pel_size));
+
+	png_write_frame_tail(write->pPng, write->pInfo);
+
+	return 0;
+}
+
+/* Allocate the two frame-sized streaming buffers (previous frame and the
+ * frame being accumulated). Nothing bigger than these two single-frame
+ * buffers is ever allocated by the animation writer.
+ */
+static int
+write_apng_init_buffers(Write *write, VipsImage *in)
+{
+	write->apng_pel_size = VIPS_IMAGE_SIZEOF_PEL(in);
+	write->apng_line_stride = VIPS_IMAGE_SIZEOF_LINE(in);
+	write->apng_frame_size =
+		(gsize) write->apng_line_stride * write->page_height;
+
+	if (!(write->apng_prev =
+			vips_tracked_malloc(write->apng_frame_size)) ||
+		!(write->apng_cur =
+			vips_tracked_malloc(write->apng_frame_size))) {
+		vips_error("vips2png", "%s", _("out of memory"));
+		return -1;
+	}
+
+	write->apng_any_change = FALSE;
+	write->apng_min_x = in->Xsize;
+	write->apng_max_x = -1;
+	write->apng_min_y = write->page_height;
+	write->apng_max_y = -1;
+	write->apng_no_delta =
+		g_getenv("VIPS_PNG_APNG_NODELTA") != NULL;
+
+	return 0;
+}
+
+/* Find the first and last pixel column that differs between two rows.
+ * Returns FALSE when the rows are identical.
+ */
+static gboolean
+write_apng_row_extent(const VipsPel *a, const VipsPel *b,
+	int width, int pel_size, int *min_x, int *max_x)
+{
+	gboolean changed = FALSE;
+
+	for (int x = 0; x < width; x++) {
+		const VipsPel *pa = a + (gsize) x * pel_size;
+		const VipsPel *pb = b + (gsize) x * pel_size;
+
+		if (memcmp(pa, pb, pel_size) != 0) {
+			if (!changed) {
+				*min_x = x;
+				changed = TRUE;
+			}
+			*max_x = x;
+		}
+	}
+
+	return changed;
+}
+
+/* As write_png_block(), but for animated writes. Rows arrive strictly
+ * top-to-bottom with no gaps (see vips_sink_disc()), so we can diff each
+ * frame against the previous one as it streams in, and emit a frame only
+ * once its last row has been seen. The full animation is never held in
+ * memory: at most the previous frame and one accumulation frame exist.
  */
 static int
 write_apng_block(VipsRegion *region, VipsRect *area, void *a)
 {
 	Write *write = (Write *) a;
+	VipsImage *im = region->im;
 
 	/* The area to write is always a set of complete scanlines.
 	 */
 	g_assert(area->left == 0);
-	g_assert(area->width == region->im->Xsize);
-	g_assert(area->top + area->height <= region->im->Ysize);
+	g_assert(area->width == im->Xsize);
+	g_assert(area->top + area->height <= im->Ysize);
 
 	/* Catch PNG errors.
 	 */
 	if (setjmp(png_jmpbuf(write->pPng)))
 		return -1;
 
+	if (!write->apng_cur &&
+		write_apng_init_buffers(write, im))
+		return -1;
+
 	for (int i = 0; i < area->height; i++) {
 		int y = area->top + i;
-		int frame = y / write->page_height;
+		int frame_no = y / write->page_height;
 		int line = y % write->page_height;
+		VipsPel *src = (VipsPel *) VIPS_REGION_ADDR(region, 0, y);
+		VipsPel *cur_row = write->apng_cur +
+			(gsize) line * write->apng_line_stride;
 
-		/* The delay metadata is in ms, fcTL wants a 16-bit
-		 * fraction.
+		memcpy(cur_row, src, write->apng_line_stride);
+
+		/* The first frame has nothing to diff against and is written
+		 * as the full canvas, as the APNG default image (IDAT).
 		 */
-		int delay = frame >= write->delay_length ? 0 :
-			VIPS_CLIP(0, write->delays[frame], 65535);
+		if (frame_no == 0 ||
+			write->apng_no_delta) {
+			if (line == 0)
+				png_write_frame_head(write->pPng,
+					write->pInfo, NULL,
+					im->Xsize, write->page_height,
+					0, 0,
+					frame_no >= write->delay_length ? 0 :
+						VIPS_CLIP(0,
+							write->delays[frame_no],
+							65535),
+					1000,
+					PNG_fcTL_DISPOSE_OP_NONE,
+					PNG_fcTL_BLEND_OP_SOURCE);
 
-		if (line == 0)
-			png_write_frame_head(write->pPng, write->pInfo, NULL,
-				region->im->Xsize, write->page_height,
-				0, 0,
-				delay, 1000,
-				PNG_fcTL_DISPOSE_OP_NONE,
-				PNG_fcTL_BLEND_OP_SOURCE);
+			png_write_row(write->pPng, (png_bytep) src);
 
-		png_write_row(write->pPng,
-			(png_bytep) VIPS_REGION_ADDR(region, 0, y));
+			if (line == write->page_height - 1)
+				png_write_frame_tail(write->pPng, write->pInfo);
+		}
+		else if (line == 0) {
+			/* Start accumulating the diff for this frame.
+			 */
+			write->apng_any_change = FALSE;
+			write->apng_min_x = im->Xsize;
+			write->apng_max_x = -1;
+			write->apng_min_y = write->page_height;
+			write->apng_max_y = -1;
+		}
 
+		if (frame_no > 0 &&
+			!write->apng_no_delta) {
+			const VipsPel *prev_row = write->apng_prev +
+				(gsize) line * write->apng_line_stride;
+			int row_min_x, row_max_x;
+
+			if (write_apng_row_extent(prev_row, cur_row,
+					im->Xsize, write->apng_pel_size,
+					&row_min_x, &row_max_x)) {
+				if (!write->apng_any_change) {
+					write->apng_min_y = line;
+					write->apng_any_change = TRUE;
+				}
+				write->apng_min_x =
+					VIPS_MIN(write->apng_min_x, row_min_x);
+				write->apng_max_x =
+					VIPS_MAX(write->apng_max_x, row_max_x);
+				write->apng_max_y = line;
+			}
+		}
+
+		/* End of frame: emit the smallest exact replacement.
+		 */
+		if (line == write->page_height - 1 &&
+			frame_no > 0 &&
+			!write->apng_no_delta) {
+			if (!write->apng_any_change) {
+				/* No pixels changed: emit a harmless 1x1
+				 * SOURCE frame so the delay and the frame
+				 * count are preserved exactly.
+				 */
+				write_apng_emit_frame(write, frame_no,
+					write->apng_cur, 0, 0, 1, 1);
+			}
+			else {
+				write_apng_emit_frame(write, frame_no,
+					write->apng_cur,
+					write->apng_min_x, write->apng_min_y,
+					write->apng_max_x - write->apng_min_x + 1,
+					write->apng_max_y - write->apng_min_y + 1);
+			}
+		}
+
+		/* Keep the just-finished frame as the previous one for the
+		 * next diff. Two frame-sized buffers only: the accumulation
+		 * buffer is reused in place next frame.
+		 */
 		if (line == write->page_height - 1)
-			png_write_frame_tail(write->pPng, write->pInfo);
+			memcpy(write->apng_prev, write->apng_cur,
+				write->apng_frame_size);
 	}
 
 	return 0;

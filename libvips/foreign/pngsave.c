@@ -503,6 +503,16 @@ vips_foreign_save_png_buffer_init(VipsForeignSavePngBuffer *buffer)
  * using the "delay" and "loop" metadata for frame timing. This needs
  * libvips to be compiled with an APNG-capable libpng.
  *
+ * After the first frame, each frame is diffed against the previous one and
+ * only the tight bounding box of the changed pixels is written, with
+ * DISPOSE_OP_NONE and BLEND_OP_SOURCE, so animations with a static
+ * background are much smaller while decoding to exactly the same pixels.
+ * A frame that is identical to its predecessor is written as a harmless
+ * 1x1 frame, preserving frame count and timing. Frames are streamed, so the
+ * whole animation is never held in memory. Set the
+ * VIPS_PNG_APNG_NODELTA environment variable to force every frame to be
+ * written as the full canvas instead.
+ *
  * ::: tip "Optional arguments"
  *     * @compression: `gint`, compression level
  *     * @interlace: `gboolean`, interlace image
