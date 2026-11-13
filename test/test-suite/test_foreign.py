@@ -2267,6 +2267,170 @@ class TestForeign:
         assert im.format == "uchar"
         assert im.get("bits-per-sample") == 8
 
+    @skip_if_no("jxlload")
+    def test_jxlload_animation(self):
+        # four frames on a 32x24 canvas, 8-bit RGBA
+        im = pyvips.Image.new_from_file(JXL_ANIM_CROP_FILE,
+            n=-1, access="sequential")
+        assert im.width == 32
+        assert im.height == 4 * 24
+        assert im.bands == 4
+        assert im.format == "uchar"
+        assert im.get("n-pages") == 4
+        assert im.get("page-height") == 24
+        assert im.get("delay") == [100, 100, 100, 100]
+        assert im.get("loop") == 0
+        assert im.get("gif-loop") == 0
+        assert im.get("bits-per-sample") == 8
+
+        # default load returns only the first frame
+        first = pyvips.Image.new_from_file(JXL_ANIM_CROP_FILE)
+        assert first.width == 32
+        assert first.height == 24
+
+        # every page must be a distinct, fully coalesced frame
+        pages = [im.crop(0, i * 24, 32, 24) for i in range(4)]
+        page_signatures = [page(0, 0) for page in pages]
+        assert len({str(s) for s in page_signatures}) > 1
+
+        # frame 2 (index 1) is a cropped layer restricted to x>=4, y>=3.
+        # Outside its crop rectangle the canvas is cleared to transparent
+        # black, while pixels inside the crop are blended and keep an alpha.
+        assert pages[1](0, 0) == [0.0, 0.0, 0.0, 0.0]
+        inside = pages[1](5, 5)
+        assert inside[3] > 0
+        # the following full frame repaints the whole canvas opaquely
+        assert pages[3](0, 0)[3] == 255
+
+        # page / n selection
+        two = pyvips.Image.jxlload(JXL_ANIM_CROP_FILE, page=1, n=2)
+        assert two.width == 32
+        assert two.height == 2 * 24
+        assert two.get("page-height") == 24
+
+        # single-page lazy access to a later frame matches the stacked image
+        lazy = pyvips.Image.jxlload(JXL_ANIM_CROP_FILE, page=3, n=1)
+        assert lazy.width == 32
+        assert lazy.height == 24
+        assert lazy(0, 0) == pages[3](0, 0)
+
+        # a page past the end is a hard, distinguishable error
+        with pytest.raises(pyvips.error.Error):
+            pyvips.Image.jxlload(JXL_ANIM_CROP_FILE, page=4, n=1)
+
+    @skip_if_no("jxlload")
+    def test_jxlload_animation_16bit(self):
+        # 16-bit RGBA frames keep their depth and alpha, with distinct delays
+        im = pyvips.Image.new_from_file(JXL_ANIM_16BIT_FILE,
+            n=-1, access="sequential")
+        assert im.width == 16
+        assert im.height == 3 * 12
+        assert im.format == "ushort"
+        assert im.bands == 4
+        assert im.get("n-pages") == 3
+        assert im.get("page-height") == 12
+        assert im.get("bits-per-sample") == 16
+        assert im.get("delay") == [50, 75, 100]
+
+        # exact per-frame pixels, including the alpha channel
+        f0 = im.crop(0, 0, 16, 12)
+        f2 = im.crop(0, 2 * 12, 16, 12)
+        assert f0(0, 0) == [0.0, 20000.0, 40000.0, 30000.0]
+        assert f2(0, 0) == [20000.0, 20000.0, 40000.0, 30000.0]
+
+    @skip_if_no("jxlload")
+    def test_jxlload_loop(self):
+        im = pyvips.Image.new_from_file(JXL_ANIM_LOOP_FILE, n=-1)
+        assert im.get("n-pages") == 2
+        assert im.get("loop") == 3
+        # deprecated gif-loop alias is offset by one (except for infinite)
+        assert im.get("gif-loop") == 2
+        # tps 10 with durations 2 and 5 ticks => 200 and 500 ms
+        assert im.get("delay") == [200, 500]
+
+    @skip_if_no("jxlload")
+    def test_jxlload_multipage(self):
+        # all frame durations are 0xffffffff: a document, not an animation
+        im = pyvips.Image.new_from_file(JXL_MULTIPAGE_FILE, n=-1)
+        assert im.get("n-pages") == 4
+        assert im.width == 12
+        assert im.height == 4 * 10
+        assert im.get("page-height") == 10
+        # no animation metadata for a multipage file
+        assert im.get_typeof("delay") == 0
+        assert im.get_typeof("loop") == 0
+
+        # pages are still selectable
+        sub = pyvips.Image.jxlload(JXL_MULTIPAGE_FILE, page=2, n=2)
+        assert sub.height == 2 * 10
+
+    @skip_if_no("jxlload")
+    def test_jxlload_metadata(self):
+        im = pyvips.Image.new_from_file(JXL_ANIM_META_FILE, n=-1)
+        # EXIF is normalised with the "Exif\0\0" prefix
+        exif = bytes(im.get("exif-data"))
+        assert exif[:6] == b"Exif\x00\x00"
+        # XMP box is exposed
+        assert im.get_typeof("xmp-data") != 0
+        assert im.get("n-pages") == 2
+
+    @skip_if_no("jxlload")
+    def test_jxlload_many_frames(self):
+        # a large frame count streams without materialising every frame
+        im = pyvips.Image.new_from_file(JXL_ANIM_MANY_FILE,
+            n=-1, access="sequential")
+        assert im.get("n-pages") == 64
+        assert im.height == 64 * 8
+        # force the whole sequential decode
+        im.avg()
+
+        # a late page can be reached directly via lazy frame skipping
+        last = pyvips.Image.jxlload(JXL_ANIM_MANY_FILE, page=63, n=1)
+        assert last.width == 8
+        assert last.height == 8
+
+    @skip_if_no("jxlload")
+    def test_jxlload_corrupt_exif(self):
+        # corrupt EXIF boxes must not lose the pixels: the metadata is
+        # dropped with a warning instead
+        for path in (JXL_BAD_EXIF_OFFSET_FILE,
+            JXL_BAD_EXIF_SHORT_FILE,
+            JXL_BAD_EXIF_EMPTY_FILE):
+            im = pyvips.Image.new_from_file(path)
+            assert im.width == 8
+            assert im.height == 8
+            im.avg()
+            assert im.get_typeof("exif-data") == 0
+
+        # the well-formed control case keeps its EXIF
+        good = pyvips.Image.new_from_file(JXL_GOOD_EXIF_FILE)
+        assert good.get_typeof("exif-data") != 0
+
+    @skip_if_no("jxlload")
+    def test_jxlload_truncated(self):
+        # truncated codestreams fail with a distinct error, never a half image
+        for path in JXL_TRUNCATED_FILES:
+            with pytest.raises(pyvips.error.Error, match="truncated"):
+                im = pyvips.Image.new_from_file(path)
+                im.avg()
+
+        # truncating an animation part-way through its frames is caught at
+        # pixel time too
+        data = open(JXL_ANIM_MANY_FILE, "rb").read()
+        with pytest.raises(pyvips.error.Error, match="truncated"):
+            im = pyvips.Image.new_from_buffer(
+                data[:len(data) // 2], "", n=-1, access="sequential")
+            im.avg()
+
+    @skip_if_no("jxlload")
+    def test_jxlload_buffer(self):
+        # the buffer entry point behaves identically for an animation
+        data = open(JXL_ANIM_CROP_FILE, "rb").read()
+        im = pyvips.Image.jxlload_buffer(data, n=-1, access="sequential")
+        assert im.get("n-pages") == 4
+        assert im.height == 4 * 24
+        im.avg()
+
     @skip_if_no("qoiload")
     def test_qoi(self):
         def qoi_valid(im):

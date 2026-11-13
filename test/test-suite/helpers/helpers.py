@@ -87,6 +87,23 @@ UHDR_FILE = os.path.join(IMAGES, "ultra-hdr.jpg")
 TYPE_LIGHT_SANS_FONT = os.path.join(FONTS, "TypeLightSans.ttf") # CC0 https://ggbot.itch.io/ggbotnet-fonts-cc0
 UHDR_ODD_DIMENSIONS_FILE = os.path.join(IMAGES, "gainmap-odd-dimensions.jpg")
 
+# Animated / multipage JPEG XL assets (see images/jxl/make-test-jxl.c)
+JXL_ANIM_CROP_FILE = os.path.join(IMAGES, "jxl", "anim-crop.jxl")
+JXL_ANIM_16BIT_FILE = os.path.join(IMAGES, "jxl", "anim-16bit.jxl")
+JXL_MULTIPAGE_FILE = os.path.join(IMAGES, "jxl", "multipage.jxl")
+JXL_ANIM_LOOP_FILE = os.path.join(IMAGES, "jxl", "anim-loop.jxl")
+JXL_ANIM_META_FILE = os.path.join(IMAGES, "jxl", "anim-meta.jxl")
+JXL_ANIM_MANY_FILE = os.path.join(IMAGES, "jxl", "anim-many.jxl")
+JXL_GOOD_EXIF_FILE = os.path.join(IMAGES, "jxl", "good-exif.jxl")
+JXL_BAD_EXIF_OFFSET_FILE = os.path.join(IMAGES, "jxl", "bad-exif-offset.jxl")
+JXL_BAD_EXIF_SHORT_FILE = os.path.join(IMAGES, "jxl", "bad-exif-short.jxl")
+JXL_BAD_EXIF_EMPTY_FILE = os.path.join(IMAGES, "jxl", "bad-exif-empty.jxl")
+JXL_TRUNCATED_FILES = [
+    os.path.join(IMAGES, "jxl", "truncated-12.jxl"),
+    os.path.join(IMAGES, "jxl", "truncated-20.jxl"),
+    os.path.join(IMAGES, "jxl", "truncated-40.jxl"),
+]
+
 unsigned_formats = ["uchar", "ushort", "uint"]
 signed_formats = ["char", "short", "int"]
 float_formats = ["float", "double"]

@@ -62,10 +62,6 @@
 
 /* TODO:
  *
- * - add metadata support
- *
- * - add animation support
- *
  * - add "shrink" option to read out 8x shrunk image?
  *
  * - fix scRGB gamma
@@ -139,18 +135,10 @@ typedef struct _VipsForeignLoadJxl {
 	size_t *box_size;
 	uint8_t **box_data;
 
-	/* Number of errors reported during load -- use this to block load of
-	 * corrupted images.
+	/* Set when the source ends before the decoder reports JXL_DEC_SUCCESS:
+	 * the codestream is truncated. Used to give a distinct error.
 	 */
-	int n_errors;
-
-	/* If we need to upsample tiles read from opj.
-	 */
-	gboolean upsample;
-
-	/* If we need to do ycc->rgb conversion on load.
-	 */
-	gboolean ycc_to_rgb;
+	gboolean truncated;
 } VipsForeignLoadJxl;
 
 typedef VipsForeignLoadClass VipsForeignLoadJxlClass;
@@ -187,6 +175,24 @@ vips_foreign_load_jxl_error(VipsForeignLoadJxl *jxl, const char *details)
 	/* TODO ... jxl has no way to get error messages at the moment.
 	 */
 	vips_error(class->nickname, "error %s", details);
+}
+
+/* Report the failure of a JxlDecoderProcessInput loop, distinguishing a
+ * truncated source (the input ended before JXL_DEC_SUCCESS) from any other
+ * decoder error so callers can tell "incomplete file" apart from
+ * "corrupt file".
+ */
+static void
+vips_foreign_load_jxl_process_error(VipsForeignLoadJxl *jxl)
+{
+	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS(jxl);
+
+	if (jxl->truncated)
+		vips_error(class->nickname, "%s",
+			_("truncated JPEG XL codestream"));
+	else
+		vips_error(class->nickname, "%s",
+			_("corrupt JPEG XL codestream"));
 }
 
 static int
@@ -517,8 +523,13 @@ vips_foreign_load_jxl_process(VipsForeignLoadJxl *jxl)
 					jxl->input_buffer, jxl->bytes_in_buffer) != JXL_DEC_SUCCESS)
 				return JXL_DEC_ERROR;
 
-		if (!bytes_read)
+		if (!bytes_read) {
+			/* The source has no more data but the decoder is still
+			 * asking for input: the codestream is truncated.
+			 */
+			jxl->truncated = TRUE;
 			JxlDecoderCloseInput(jxl->decoder);
+		}
 	}
 
 #ifdef DEBUG
@@ -556,7 +567,7 @@ vips_foreign_load_jxl_read_frame(VipsForeignLoadJxl *jxl, VipsImage *frame,
 	do {
 		switch ((status = vips_foreign_load_jxl_process(jxl))) {
 		case JXL_DEC_ERROR:
-			vips_foreign_load_jxl_error(jxl, "JxlDecoderProcessInput");
+			vips_foreign_load_jxl_process_error(jxl);
 			return -1;
 
 		case JXL_DEC_FRAME:
@@ -595,7 +606,10 @@ vips_foreign_load_jxl_read_frame(VipsForeignLoadJxl *jxl, VipsImage *frame,
 		}
 	} while (status != JXL_DEC_SUCCESS);
 
-	/* We didn't find the required frame
+	/* We reached JXL_DEC_SUCCESS (a complete codestream) without the
+	 * requested frame: the header advertised a frame count the pixels
+	 * did not provide. A genuinely truncated source is reported above via
+	 * JXL_DEC_ERROR instead.
 	 */
 	vips_error(class->nickname, "%s", _("not enough frames"));
 	return -1;
@@ -629,7 +643,12 @@ vips_foreign_load_jxl_generate(VipsRegion *out_region,
 	return 0;
 }
 
-/* JPEG XL stores EXIF data without leading "Exif\0\0" with offset
+/* Validate and normalise the EXIF box. JPEG XL stores EXIF without the
+ * leading "Exif\0\0" prefix and with a 4-byte big-endian offset to the TIFF
+ * header.
+ *
+ * A corrupt EXIF box must not prevent the pixels from loading: we warn and
+ * drop the metadata. Returns 0 unless memory allocation fails.
  */
 static int
 vips_foreign_load_jxl_fix_exif(VipsForeignLoadJxl *jxl)
@@ -639,16 +658,22 @@ vips_foreign_load_jxl_fix_exif(VipsForeignLoadJxl *jxl)
 		return 0;
 
 	if (jxl->exif_size < 4) {
-		g_warning("invalid data in EXIF box");
-		return -1;
+		g_warning("invalid data in EXIF box: "
+			"box too short, dropping EXIF metadata");
+		VIPS_FREE(jxl->exif_data);
+		jxl->exif_size = 0;
+		return 0;
 	}
 
 	/* Offset is stored in big-endian
 	 */
 	size_t offset = GUINT32_FROM_BE(*((guint32 *) jxl->exif_data));
 	if (offset > jxl->exif_size - 4) {
-		g_warning("invalid data in EXIF box");
-		return -1;
+		g_warning("invalid data in EXIF box: "
+			"bad TIFF offset, dropping EXIF metadata");
+		VIPS_FREE(jxl->exif_data);
+		jxl->exif_size = 0;
+		return 0;
 	}
 
 	size_t new_size = jxl->exif_size - 4 - offset + 6;
@@ -870,6 +895,16 @@ vips_foreign_load_jxl_set_header(VipsForeignLoadJxl *jxl, VipsImage *out)
 			return -1;
 		}
 
+		/* The pages are stacked vertically: make sure the total output
+		 * height cannot overflow or exceed the vips coordinate limit,
+		 * even for a crafted file with a huge frame count.
+		 */
+		gint64 total_height = (gint64) jxl->info.ysize * jxl->n;
+		if (total_height <= 0 || total_height >= VIPS_MAX_COORD) {
+			vips_error(class->nickname, "%s", _("image too large"));
+			return -1;
+		}
+
 		vips_image_set_int(out, VIPS_META_N_PAGES, jxl->frame_count);
 
 		if (jxl->n > 1)
@@ -878,13 +913,26 @@ vips_foreign_load_jxl_set_header(VipsForeignLoadJxl *jxl, VipsImage *out)
 		if (jxl->is_animated) {
 			int *delay = (int *) jxl->delay->data;
 
+			/* is_animated guarantees at least one real delay entry.
+			 */
+			g_assert(jxl->delay->len >= 1);
+
 			vips_image_set_array_int(out, "delay", delay, jxl->frame_count);
 
 			/* gif uses centiseconds for delays
 			 */
 			vips_image_set_int(out, "gif-delay", rint(delay[0] / 10.0));
 
-			vips_image_set_int(out, "loop", jxl->info.animation.num_loops);
+			vips_image_set_int(out, "loop",
+				jxl->info.animation.num_loops);
+
+			/* Deprecated gif-loop alias, following gifload/webp
+			 * conventions: a JXL loop count of 0 (infinite) maps to
+			 * gif-loop 0, otherwise it is one less.
+			 */
+			vips_image_set_int(out, "gif-loop",
+				jxl->info.animation.num_loops == 0 ? 0 :
+				jxl->info.animation.num_loops - 1);
 		}
 	}
 	else {
@@ -954,6 +1002,7 @@ vips_foreign_load_jxl_set_header(VipsForeignLoadJxl *jxl, VipsImage *out)
 static int
 vips_foreign_load_jxl_header(VipsForeignLoad *load)
 {
+	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS(load);
 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) load;
 
 	JxlDecoderStatus status;
@@ -989,13 +1038,14 @@ vips_foreign_load_jxl_header(VipsForeignLoad *load)
 	}
 
 	jxl->frame_count = 0;
+	jxl->truncated = FALSE;
 
 	/* Read to the end of the header.
 	 */
 	do {
 		switch ((status = vips_foreign_load_jxl_process(jxl))) {
 		case JXL_DEC_ERROR:
-			vips_foreign_load_jxl_error(jxl, "JxlDecoderProcessInput");
+			vips_foreign_load_jxl_process_error(jxl);
 			return -1;
 
 		case JXL_DEC_BOX:
@@ -1096,9 +1146,19 @@ vips_foreign_load_jxl_header(VipsForeignLoad *load)
 					&jxl->format,
 #endif
 					JXL_COLOR_PROFILE_TARGET_DATA, &jxl->icc_size)) {
-				vips_foreign_load_jxl_error(jxl, "JxlDecoderGetICCProfileSize");
-				return -1;
+				/* No usable ICC profile (common for structured
+				 * encodings, or a corrupt one): continue
+				 * without ICC metadata rather than dropping
+				 * the pixels.
+				 */
+				g_warning("could not read JPEG XL ICC profile, "
+					"continuing without colour profile");
+				jxl->icc_size = 0;
+				break;
 			}
+
+			if (jxl->icc_size == 0)
+				break;
 
 #ifdef DEBUG
 			printf("vips_foreign_load_jxl_header: %zd byte profile\n",
@@ -1113,9 +1173,12 @@ vips_foreign_load_jxl_header(VipsForeignLoad *load)
 #endif
 					JXL_COLOR_PROFILE_TARGET_DATA,
 					jxl->icc_data, jxl->icc_size)) {
-				vips_foreign_load_jxl_error(jxl,
-					"JxlDecoderGetColorAsICCProfile");
-				return -1;
+				/* Corrupt profile: warn and drop it.
+				 */
+				g_warning("invalid JPEG XL ICC profile, "
+					"dropping colour profile");
+				VIPS_FREE(jxl->icc_data);
+				jxl->icc_size = 0;
 			}
 			break;
 
@@ -1151,7 +1214,17 @@ vips_foreign_load_jxl_header(VipsForeignLoad *load)
 		}
 	} while (status != JXL_DEC_SUCCESS);
 
-	/* Detect JXL multipage (rather than animated).
+	/* A valid JXL codestream always has at least one displayed frame.
+	 * Reaching the end with none means a malformed file: fail cleanly
+	 * rather than emitting an image with no pixels.
+	 */
+	if (jxl->frame_count <= 0) {
+		vips_error(class->nickname, "%s", _("no frames in JPEG XL"));
+		return -1;
+	}
+
+	/* Detect JXL multipage (rather than animated). A zero-length delay
+	 * array is harmless: g_array_index on it is never reached.
 	 */
 	int *delay = (int *) jxl->delay->data;
 	for (int i = 0; i < jxl->delay->len; i++)
@@ -1207,6 +1280,12 @@ vips_foreign_load_jxl_load(VipsForeignLoad *load)
 			"JxlDecoderSubscribeEvents");
 		return -1;
 	}
+
+	/* Fresh decode pass: clear the header-pass truncation state and the
+	 * frame cursor so streaming starts from the first displayed frame.
+	 */
+	jxl->truncated = FALSE;
+	jxl->frame_no = 0;
 
 	if (vips_foreign_load_jxl_fill_input(jxl, 0) < 0)
 		return -1;
