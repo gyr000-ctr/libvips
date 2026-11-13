@@ -910,6 +910,122 @@ class TestForeign:
             assert g.get("delay") == x4.get("delay")
             assert g.get("page-height") == x4.get("page-height")
 
+    @skip_if_no_apng
+    def test_apng_interlaced_matches_progressive(self):
+        # Adam7 interlaced and progressive twins carry identical frames; the
+        # de-interlaced output must match byte for byte. The combo asset
+        # exercises every dispose (NONE/BACKGROUND/PREVIOUS) and blend
+        # (SOURCE/OVER) combination on sub-rectangle frames.
+        interlaced = pyvips.Image.new_from_file(
+            APNG_INTERLACED_FILE, n=-1).copy_memory()
+        progressive = pyvips.Image.new_from_file(
+            APNG_INTERLACED_PROGRESSIVE_FILE, n=-1).copy_memory()
+
+        assert interlaced.width == progressive.width
+        assert interlaced.height == progressive.height
+        assert interlaced.bands == progressive.bands
+        assert (interlaced - progressive).abs().max() == 0
+
+        # metadata semantics are unchanged for an interlaced animation.
+        assert interlaced.get("n-pages") == 6
+        assert interlaced.get("page-height") == 8
+        assert interlaced.get("loop") == 3
+        assert interlaced.get("delay") == [100, 150, 200, 250, 300, 350]
+
+    @skip_if_no_apng
+    def test_apng_interlaced_page_and_layout(self):
+        # page/n handling and the vertically stacked layout must behave
+        # exactly like a progressive APNG (the existing page semantics are
+        # preserved, including for partial page ranges).
+        #
+        # Disable the operation cache before any load: the png file source is
+        # a single-pass sequential reader, and a cached, already-drained load
+        # graph for the same filename would otherwise be handed back and fail
+        # on rewind. This is independent of interlacing; buffer loads (which
+        # own a fresh source each time) are unaffected.
+        old_cache = pyvips.cache_get_max()
+        pyvips.cache_set_max(0)
+        try:
+            page_height = 8
+            full = pyvips.Image.new_from_file(
+                APNG_INTERLACED_FILE, n=-1).copy_memory()
+            assert full.height == 6 * page_height
+            assert full.get("page-height") == page_height
+
+            assert pyvips.Image.new_from_file(
+                APNG_INTERLACED_FILE).height == page_height
+
+            # the same page/n selection produces identical pixels in both
+            # twins.
+            for page, n in ((0, 1), (1, 1), (2, 2), (3, 1)):
+                a = pyvips.Image.new_from_file(
+                    APNG_INTERLACED_FILE, page=page, n=n).copy_memory()
+                b = pyvips.Image.new_from_file(
+                    APNG_INTERLACED_PROGRESSIVE_FILE,
+                    page=page, n=n).copy_memory()
+                assert a.height == n * page_height
+                assert (a - b).abs().max() == 0
+
+            # a page outside the frame count is rejected.
+            with pytest.raises(pyvips.error.Error):
+                pyvips.Image.new_from_file(
+                    APNG_INTERLACED_FILE, page=6, n=1)
+        finally:
+            pyvips.cache_set_max(old_cache)
+
+    @skip_if_no_apng
+    def test_apng_interlaced_16bit(self):
+        interlaced = pyvips.Image.new_from_file(
+            APNG_INTERLACED_16BIT_FILE, n=-1).copy_memory()
+        progressive = pyvips.Image.new_from_file(
+            APNG_INTERLACED_16BIT_PROGRESSIVE_FILE, n=-1).copy_memory()
+
+        assert interlaced.format == "ushort"
+        assert (interlaced - progressive).abs().max() == 0
+        # half-alpha red base frame survives Adam7 de-interlacing.
+        assert interlaced(0, 0) == [65535, 0, 0, 32768]
+
+    @skip_if_no_apng
+    def test_apng_interlaced_hidden_first_frame(self):
+        interlaced = pyvips.Image.new_from_file(
+            APNG_INTERLACED_HIDDEN_FILE, n=-1).copy_memory()
+        progressive = pyvips.Image.new_from_file(
+            APNG_INTERLACED_HIDDEN_PROGRESSIVE_FILE, n=-1).copy_memory()
+
+        assert interlaced.get("n-pages") == 2
+        assert interlaced.get("delay") == [100, 200]
+        assert (interlaced - progressive).abs().max() == 0
+        # the hidden white default image must never appear: frame 0 is red.
+        assert interlaced(0, 0) == [255, 0, 0, 255]
+
+    @skip_if_no_apng
+    def test_apng_interlaced_corrupt(self):
+        # Build corrupt variants in memory from the generator so the test
+        # does not depend on extra checked-in binaries. Each failure mode is
+        # distinct and none may crash or write out of bounds.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "make_apng_assets", APNG_ASSET_TOOL)
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+
+        good = generator._build_combo(True)
+
+        def expect_fails(blob, fragment):
+            with pytest.raises(pyvips.error.Error) as exc:
+                pyvips.Image.pngload_buffer(blob, n=-1).copy_memory()
+            assert fragment in str(exc.value)
+
+        # out-of-bounds frame region is rejected as an fcTL geometry error.
+        expect_fails(generator.corrupt_frame_geometry(good),
+            "Oversized frame in fcTL")
+        # a truncated file is reported as a read/truncation error.
+        expect_fails(generator.truncate_file(good), "data")
+        # a malformed fcTL chunk fails at open time.
+        with pytest.raises(pyvips.error.Error):
+            pyvips.Image.pngload_buffer(
+                generator.corrupt_fctl_length(good), n=-1)
+
     @skip_if_no("tiffload")
     def test_tiff(self):
         def tiff_valid(im):

@@ -151,6 +151,8 @@ const char *vips__png_suffs[] = { ".png", NULL };
 
 #include <png.h>
 
+typedef struct _Read Read;
+
 /* Compat defines for APNG constants.
  * libpng 1.8+ uses PNG_fcTL_DISPOSE_OP_NONE etc.
  * libpng 1.6 + APNG patch uses PNG_DISPOSE_OP_NONE etc.
@@ -183,6 +185,7 @@ user_error_function(png_structp png_ptr, png_const_charp error_msg)
 	longjmp(png_jmpbuf(png_ptr), -1);
 }
 
+/* Read-side error handler is defined after the Read struct below. */
 static void
 user_warning_function(png_structp png_ptr, png_const_charp warning_msg)
 {
@@ -197,7 +200,7 @@ user_warning_function(png_structp png_ptr, png_const_charp warning_msg)
 
 /* What we track during a PNG read.
  */
-typedef struct {
+struct _Read {
 	char *name;
 	VipsImage *out;
 	VipsFailOn fail_on;
@@ -217,6 +220,12 @@ typedef struct {
 	unsigned char *next_byte;
 	gint64 bytes_in_buffer;
 
+	/* Last fatal libpng message, captured by read_error_function() so the
+	 * setjmp() handlers can report a specific error instead of a generic
+	 * failure message. Used by all PNG reads, not just APNG.
+	 */
+	char png_error[256];
+
 #ifdef PNG_APNG_SUPPORTED
 	/* APNG animation state.
 	 */
@@ -224,6 +233,8 @@ typedef struct {
 	int n;					/* number of frames to load, -1 for all */
 
 	gboolean is_animated;	/* read with APNG API */
+	gboolean is_interlaced;	/* Adam7 interlaced APNG */
+
 	int frame_count;		/* number of frames in the animation */
 	int page_height;		/* height of each frame in animation */
 	int loop;				/* loop count, 0 for forever */
@@ -237,6 +248,21 @@ typedef struct {
 	VipsRegion *decode;
 	VipsRegion *previous;
 
+	/* Interlaced frames are de-interlaced by libpng into a full-sized row.
+	 * dummy_row absorbs the png_read_row() calls that fall on rows the
+	 * current Adam7 pass does not touch: libpng still expects one read per
+	 * scanline per pass.
+	 */
+	png_bytep dummy_row;
+
+	/* Tight, frame-sized buffer an interlaced frame is accumulated into
+	 * across the seven Adam7 passes. libpng only writes the pixels a pass
+	 * contains, leaving the rest of the row untouched, so the same rows
+	 * must be reused across passes. frame_buffer_size is its allocation.
+	 */
+	png_bytep frame_buffer;
+	size_t frame_buffer_size;
+
 	/* Number of next frame we composite to the canvas.
 	 */
 	int next_frame;
@@ -249,7 +275,25 @@ typedef struct {
 	VipsRect dispose_rect;
 #endif /*PNG_APNG_SUPPORTED*/
 
-} Read;
+};
+
+/* Read-side error handler: as user_error_function(), but also stashes the
+ * message on the Read so the setjmp() recovery points can distinguish fcTL
+ * geometry errors from truncated frame data.
+ */
+static void
+read_error_function(png_structp png_ptr, png_const_charp error_msg)
+{
+	Read *read = png_get_io_ptr(png_ptr);
+
+	g_warning("%s", error_msg);
+
+	if (read != NULL)
+		g_strlcpy(read->png_error, error_msg,
+			sizeof(read->png_error));
+
+	longjmp(png_jmpbuf(png_ptr), -1);
+}
 
 /* Can be called many times.
  */
@@ -269,6 +313,8 @@ read_destroy(Read *read)
 	VIPS_UNREF(read->canvas);
 	VIPS_UNREF(read->decode);
 	VIPS_UNREF(read->previous);
+	VIPS_FREE(read->dummy_row);
+	VIPS_FREE(read->frame_buffer);
 #endif /*PNG_APNG_SUPPORTED*/
 }
 
@@ -334,13 +380,17 @@ read_new(VipsSource *source, VipsImage *out,
 	read->out = out;
 	read->source = source;
 	read->unlimited = unlimited;
+	read->png_error[0] = '\0';
 
 #ifdef PNG_APNG_SUPPORTED
 	read->page = page;
 	read->n = n;
 	read->is_animated = FALSE;
+	read->is_interlaced = FALSE;
 	read->frame_count = 1;
 	read->dispose_op = PNG_fcTL_DISPOSE_OP_NONE;
+	read->frame_buffer = NULL;
+	read->frame_buffer_size = 0;
 #endif /*PNG_APNG_SUPPORTED*/
 
 	g_object_ref(source);
@@ -350,7 +400,7 @@ read_new(VipsSource *source, VipsImage *out,
 
 	if (!(read->pPng = png_create_read_struct(
 			  PNG_LIBPNG_VER_STRING, NULL,
-			  user_error_function, user_warning_function)))
+			  read_error_function, user_warning_function)))
 		return NULL;
 
 	/* Prevent libpng (>=1.6.11) verifying sRGB profiles. Many PNGs have
@@ -610,6 +660,7 @@ apng_read_delays(Read *read, int frame_count)
 	int frame;
 
 	frame = 0;
+	gboolean truncated = FALSE;
 	for (size_t offset = 8; offset + 12 <= file_size; offset += 12 + length) {
 		const unsigned char *chunk = data + offset;
 
@@ -619,18 +670,33 @@ apng_read_delays(Read *read, int frame_count)
 		length = apng_get_u32(chunk);
 		if (length > file_size - offset - 12) {
 			g_warning("pngload: truncated chunk at offset %zu", offset);
+			truncated = TRUE;
 			break;
 		}
 
 		if (vips_isprefix("fcTL", (char *) (chunk + 4))) {
-			if (length < 26) {
+			/* A valid fcTL chunk data is exactly the 26 byte frame
+			 * control block. Some APNG writers instead prepend the
+			 * 4 byte sequence number (as fdAT always does); accept
+			 * both layouts.
+			 */
+			int seq_prefix = 0;
+
+			if (length == 4 + 26)
+				seq_prefix = 4;
+			else if (length < 26) {
 				g_warning("pngload: "
 					"malformed fcTL chunk at offset %zu", offset);
+				if (read->fail_on >= VIPS_FAIL_ON_ERROR) {
+					vips_error("png2vips", "%s",
+						_("malformed APNG fcTL chunk"));
+					return NULL;
+				}
 				break;
 			}
 
-			int num = apng_get_u16(chunk + 8 + 20);
-			int den = apng_get_u16(chunk + 8 + 22);
+			int num = apng_get_u16(chunk + 8 + seq_prefix + 20);
+			int den = apng_get_u16(chunk + 8 + seq_prefix + 22);
 
 			/* A zero denominator means 1/100 s, see the spec.
 			 */
@@ -648,7 +714,8 @@ apng_read_delays(Read *read, int frame_count)
 	if (frame < frame_count) {
 		g_warning("pngload: found %d of %d fcTL chunks", frame, frame_count);
 		if (read->fail_on >= VIPS_FAIL_ON_ERROR) {
-			vips_error("png2vips", "%s", _("malformed APNG"));
+			vips_error("png2vips", "%s", truncated ?
+				_("truncated APNG") : _("malformed APNG"));
 			return NULL;
 		}
 	}
@@ -816,14 +883,11 @@ png2vips_header(Read *read, VipsImage *out, gboolean header_only)
 		height *= read->n;
 	}
 
-	/* We read animated PNG with png_read_row(), which can't do interlaced
-	 * images.
+	/* Animated PNGs can be Adam7 interlaced too. We de-interlace the
+	 * frame sub-images ourselves in png2vips_apng_read_next_frame().
 	 */
-	if (read->is_animated &&
-		png_get_interlace_type(read->pPng, read->pInfo) != PNG_INTERLACE_NONE) {
-		vips_error("png2vips", "%s", _("interlaced APNG not supported"));
-		return -1;
-	}
+	read->is_interlaced = read->is_animated &&
+		png_get_interlace_type(read->pPng, read->pInfo) != PNG_INTERLACE_NONE;
 
 	/* We always need an alpha for animated read, since frames might not cover
 	 * the whole canvas.
@@ -925,12 +989,17 @@ png2vips_header(Read *read, VipsImage *out, gboolean header_only)
 	 *
 	 * Only set this for libpng 1.6+.
 	 *
-	 * Don't call this for animated reads: they are never interlaced (we
-	 * reject interlaced APNGs), and we read frames with png_read_row().
+	 * Interlaced APNGs are read with png_read_row() too: libpng expands
+	 * every Adam7 pass to a full, de-interlaced scanline and we place the
+	 * rows into the frame rectangle ourselves.
 	 */
 #if PNG_LIBPNG_VER > 10600
 #ifdef PNG_APNG_SUPPORTED
-	if (!read->is_animated)
+	if (read->is_animated) {
+		if (read->is_interlaced)
+			(void) png_set_interlace_handling(read->pPng);
+	}
+	else
 #endif
 		(void) png_set_interlace_handling(read->pPng);
 #endif
@@ -1171,6 +1240,120 @@ blend_op_to_s(int dispose_op)
 #endif /*DEBUG*/
 
 #ifdef PNG_APNG_SUPPORTED
+
+/* Adam7 pass geometry, see the PNG spec. For each pass, rows (relative to
+ * the frame's own pixel array) are spaced yinc apart starting at ystart.
+ * With png_set_interlace_handling(), libpng expands every row to the full
+ * frame width, placing the pass pixels at the matching x positions itself
+ * and zeroing the rest, so we only need to route whole rows.
+ */
+static const int apng_pass_ystart[7] = {
+	0, 0, 4, 0, 2, 0, 1
+};
+static const int apng_pass_yinc[7] = {
+	8, 8, 4, 4, 2, 2, 1
+};
+
+/* Copy a fully decoded frame into its rectangle on @target. The accumulation
+ * buffer rows are spaced @src_stride bytes apart (libpng's declared row
+ * size), but only frame_rect->width pixels belong to the frame, so each row
+ * is trimmed when placed on the (possibly wider) canvas.
+ */
+static void
+png2vips_apng_place_frame(VipsRegion *target, const VipsRect *frame_rect,
+	size_t pel_size, size_t src_stride, png_const_bytep frame_buffer)
+{
+	size_t frame_row_bytes = (size_t) frame_rect->width * pel_size;
+
+	for (int y = 0; y < frame_rect->height; y++)
+		memcpy(VIPS_REGION_ADDR(target,
+				frame_rect->left, frame_rect->top + y),
+			frame_buffer + (size_t) y * src_stride,
+			frame_row_bytes);
+}
+
+/* Decode one frame's worth of rows into @target's frame rectangle.
+ *
+ * Non-interlaced: libpng hands us one row per frame scanline.
+ *
+ * Interlaced (Adam7): libpng hands us seven passes of frame-height rows
+ * each. On every call it writes only the pixels the current pass contains
+ * and leaves the other positions in the destination row untouched, so each
+ * row must be supplied repeatedly across passes and the pixels accumulate.
+ * Rows a pass does not touch still consume a png_read_row() call and are
+ * read into a scratch buffer. Reading frame-height rows per pass keeps the
+ * libpng row/pass counters aligned with a normal png_read_image() interlace.
+ */
+static void
+png2vips_apng_decode_rows(Read *read, VipsRegion *target,
+	const VipsRect *frame_rect)
+{
+	size_t pel_size = VIPS_IMAGE_SIZEOF_PEL(target->im);
+	size_t frame_row_bytes = (size_t) frame_rect->width * pel_size;
+
+	if (!read->is_interlaced) {
+		for (int y = 0; y < frame_rect->height; y++) {
+			png_read_row(read->pPng, read->dummy_row, NULL);
+			memcpy(VIPS_REGION_ADDR(target,
+					frame_rect->left, frame_rect->top + y),
+				read->dummy_row, frame_row_bytes);
+		}
+
+		return;
+	}
+
+	/* libpng's declared row size can exceed the frame width (it is based
+	 * on the canvas width for APNG sub-frames), so use it as the
+	 * accumulation buffer stride and trim rows when placing on the canvas.
+	 */
+	size_t src_stride = png_get_rowbytes(read->pPng, read->pInfo);
+	size_t frame_bytes = src_stride * frame_rect->height;
+	if (frame_bytes > read->frame_buffer_size) {
+		VIPS_FREE(read->frame_buffer);
+		if (!(read->frame_buffer =
+				VIPS_ARRAY(NULL, frame_bytes, png_byte))) {
+			read->frame_buffer_size = 0;
+			return;
+		}
+		read->frame_buffer_size = frame_bytes;
+	}
+	png_bytep frame_buffer = read->frame_buffer;
+
+	for (int pass = 0; pass < 7; pass++) {
+		int target_row = apng_pass_ystart[pass];
+
+		for (int y = 0; y < frame_rect->height; y++) {
+			png_bytep row;
+
+			if (y == target_row) {
+				row = frame_buffer +
+					(size_t) y * src_stride;
+				target_row += apng_pass_yinc[pass];
+			}
+			else
+				row = read->dummy_row;
+
+			png_read_row(read->pPng, row, NULL);
+		}
+	}
+
+	png2vips_apng_place_frame(target, frame_rect,
+		pel_size, src_stride, frame_buffer);
+}
+
+/* Report why an APNG frame read failed. libpng's own message (captured by
+ * read_error_function()) is preferred because it pinpoints fcTL geometry
+ * problems; otherwise fall back to a generic truncation error.
+ */
+static void
+png2vips_apng_read_error(Read *read)
+{
+	if (read->png_error[0] != '\0')
+		vips_error("png2vips", "%s", read->png_error);
+	else
+		vips_error("png2vips", "%s", _("truncated APNG frame data"));
+}
+
 static int
 png2vips_apng_read_next_frame(Read *read)
 {
@@ -1198,8 +1381,11 @@ png2vips_apng_read_next_frame(Read *read)
 
 	/* Read this frame.
 	 */
-	if (setjmp(png_jmpbuf(read->pPng)))
+	read->png_error[0] = '\0';
+	if (setjmp(png_jmpbuf(read->pPng))) {
+		png2vips_apng_read_error(read);
 		return -1;
+	}
 
 	png_read_frame_head(read->pPng, read->pInfo);
 
@@ -1249,10 +1435,7 @@ png2vips_apng_read_next_frame(Read *read)
 	VipsRegion *target = blend_op == PNG_fcTL_BLEND_OP_OVER ?
 		read->decode : read->canvas;
 
-	for (int y = 0; y < frame_rect.height; y++)
-		png_read_row(read->pPng,
-			VIPS_REGION_ADDR(target, frame_rect.left, frame_rect.top + y),
-			NULL);
+	png2vips_apng_decode_rows(read, target, &frame_rect);
 
 	if (target == read->decode)
 		vips_region_blend_over(read->decode, read->canvas,
@@ -1347,17 +1530,32 @@ png2vips_apng_setup(Read *read, VipsImage *out)
 		vips_region_buffer(read->previous, &frame))
 		return -1;
 
+	/* Scratch scanline that absorbs every png_read_row() before the pixels
+	 * are placed on the canvas. It must hold the widest post-transform row,
+	 * which is a full canvas-width row. Interlaced frames also rely on it
+	 * for the rows an Adam7 pass does not touch.
+	 */
+	{
+		size_t rowbytes = VIPS_IMAGE_SIZEOF_LINE(read->frame_image);
+
+		if (!(read->dummy_row = VIPS_ARRAY(NULL, rowbytes, png_byte)))
+			return -1;
+	}
+
 	/* A hidden first frame is an IDAT which is not part of the animation. It
 	 * has no fcTL and is always the full canvas size. Decode and discard it.
 	 */
 	if (png_get_first_frame_is_hidden(read->pPng, read->pInfo)) {
-		if (setjmp(png_jmpbuf(read->pPng)))
+		VipsRect full_frame = { 0, 0, width, height };
+
+		read->png_error[0] = '\0';
+		if (setjmp(png_jmpbuf(read->pPng))) {
+			png2vips_apng_read_error(read);
 			return -1;
+		}
 
 		png_read_frame_head(read->pPng, read->pInfo);
-		for (int y = 0; y < read->page_height; y++)
-			png_read_row(read->pPng,
-				VIPS_REGION_ADDR(read->canvas, 0, y), NULL);
+		png2vips_apng_decode_rows(read, read->canvas, &full_frame);
 	}
 
 	/* Decode up to our start frame.
@@ -1376,7 +1574,19 @@ png2vips_image(Read *read, VipsImage *out)
 	int interlace_type = png_get_interlace_type(read->pPng, read->pInfo);
 	VipsImage **t = (VipsImage **) vips_object_local_array(VIPS_OBJECT(out), 3);
 
+#ifdef PNG_APNG_SUPPORTED
+	/* Interlaced APNGs stream through the animation pipeline, frame by
+	 * frame, rather than the whole-image interlace path below. The
+	 * animation flags are only set by png2vips_header(), which has not run
+	 * on this read instance yet, so probe the acTL chunk directly.
+	 */
+	gboolean animated_apng =
+		png_get_valid(read->pPng, read->pInfo, PNG_INFO_acTL) != 0;
+	if (interlace_type != PNG_INTERLACE_NONE &&
+		!animated_apng) {
+#else
 	if (interlace_type != PNG_INTERLACE_NONE) {
+#endif
 		/* Arg awful interlaced image. We have to load to a huge mem
 		 * buffer, then copy to out.
 		 */

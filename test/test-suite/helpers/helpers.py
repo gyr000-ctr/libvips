@@ -56,6 +56,19 @@ APNG_BLEND_OVER_FILE = os.path.join(IMAGES, "apng-blend-over.png")
 APNG_HIDDEN_FRAME_FILE = os.path.join(IMAGES, "apng-hidden-frame.png")
 APNG_OPAQUE_FILE = os.path.join(IMAGES, "apng-opaque.png")
 APNG_16BIT_FILE = os.path.join(IMAGES, "apng-16bit.png")
+APNG_INTERLACED_FILE = os.path.join(IMAGES, "apng-interlaced.png")
+APNG_INTERLACED_PROGRESSIVE_FILE = os.path.join(
+    IMAGES, "apng-interlaced-progressive.png")
+APNG_INTERLACED_16BIT_FILE = os.path.join(
+    IMAGES, "apng-interlaced-16bit.png")
+APNG_INTERLACED_16BIT_PROGRESSIVE_FILE = os.path.join(
+    IMAGES, "apng-interlaced-16bit-progressive.png")
+APNG_INTERLACED_HIDDEN_FILE = os.path.join(
+    IMAGES, "apng-interlaced-hidden.png")
+APNG_INTERLACED_HIDDEN_PROGRESSIVE_FILE = os.path.join(
+    IMAGES, "apng-interlaced-hidden-progressive.png")
+APNG_ASSET_TOOL = os.path.join(
+    os.path.dirname(IMAGES), "tools", "make_apng_assets.py")
 DICOM_FILE = os.path.join(IMAGES, "dicom_test_image.dcm")
 BMP_FILE = os.path.join(IMAGES, "MARBLES.BMP")
 NIFTI_FILE = os.path.join(IMAGES, "avg152T1_LR_nifti.nii.gz")
