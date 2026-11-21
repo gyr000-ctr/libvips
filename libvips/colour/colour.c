@@ -644,6 +644,7 @@ vips_colour_operation_init(void)
 	extern GType vips_CICP2scRGB_get_type(void);
 	extern GType vips_scRGB2CICP_get_type(void);
 	extern GType vips_profile_load_get_type(void);
+	extern GType vips_cubelut_get_type(void);
 #ifdef HAVE_LCMS2
 	extern GType vips_icc_import_get_type(void);
 	extern GType vips_icc_export_get_type(void);
@@ -689,6 +690,7 @@ vips_colour_operation_init(void)
 	vips_CICP2scRGB_get_type();
 	vips_scRGB2CICP_get_type();
 	vips_profile_load_get_type();
+	vips_cubelut_get_type();
 #ifdef HAVE_LCMS2
 	vips_icc_import_get_type();
 	vips_icc_export_get_type();

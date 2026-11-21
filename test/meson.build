@@ -100,3 +100,15 @@ test('gifsave_timeout',
     depends: test_timeout_gifsave,
     workdir: meson.current_build_dir(),
 )
+
+test_3dlut = executable('test_3dlut',
+    'test_3dlut.c',
+    dependencies: libvips_dep,
+)
+
+test('3dlut',
+    test_3dlut,
+    depends: test_3dlut,
+    workdir: meson.current_build_dir(),
+    timeout: 60,
+)

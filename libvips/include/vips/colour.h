@@ -389,6 +389,77 @@ VIPS_API
 float vips_col_dE00(
 	float L1, float a1, float b1, float L2, float a2, float b2);
 
+/**
+ * VIPS_CUBE_LUT_MAX_SIZE:
+ *
+ * The largest permitted `LUT_3D_SIZE` in a .cube file.
+ */
+#define VIPS_CUBE_LUT_MAX_SIZE (128)
+
+/**
+ * VIPS_CUBE_LUT_MAX_SHAPER_SIZE:
+ *
+ * The largest permitted `LUT_1D_SIZE` in a .cube file.
+ */
+#define VIPS_CUBE_LUT_MAX_SHAPER_SIZE (65536)
+
+/* A parsed Adobe .cube 3D LUT, see [method@CubeLUT.load_file].
+ */
+typedef struct _VipsCubeLUT VipsCubeLUT;
+
+/**
+ * VipsCubeLUTError:
+ * @VIPS_CUBE_LUT_ERROR_OPEN: the file could not be opened or read
+ * @VIPS_CUBE_LUT_ERROR_FORMAT: malformed header or keyword, data before the
+ *   size keywords, or a size keyword is missing
+ * @VIPS_CUBE_LUT_ERROR_SIZE: the declared sizes do not match the number of
+ *   data entries, or the table is too large
+ * @VIPS_CUBE_LUT_ERROR_DATA: an entry is not a finite number or has the
+ *   wrong number of values
+ *
+ * Error codes for [struct@CubeLUT] parsing.
+ */
+typedef enum {
+	VIPS_CUBE_LUT_ERROR_OPEN,
+	VIPS_CUBE_LUT_ERROR_FORMAT,
+	VIPS_CUBE_LUT_ERROR_SIZE,
+	VIPS_CUBE_LUT_ERROR_DATA
+} VipsCubeLUTError;
+
+#define VIPS_CUBE_LUT_ERROR (vips_cube_lut_error_quark())
+VIPS_API
+GQuark vips_cube_lut_error_quark(void);
+
+VIPS_API
+GType vips_cube_lut_get_type(void);
+
+VIPS_API
+VipsCubeLUT *vips_cube_lut_new(void);
+VIPS_API
+VipsCubeLUT *vips_cube_lut_ref(VipsCubeLUT *lut);
+VIPS_API
+void vips_cube_lut_unref(VipsCubeLUT *lut);
+VIPS_API
+int vips_cube_lut_load_file(VipsCubeLUT *lut, const char *filename,
+	GError **error);
+VIPS_API
+int vips_cube_lut_load_buffer(VipsCubeLUT *lut,
+	const void *data, size_t length, GError **error);
+VIPS_API
+const char *vips_cube_lut_get_title(const VipsCubeLUT *lut);
+VIPS_API
+int vips_cube_lut_get_size(const VipsCubeLUT *lut);
+VIPS_API
+int vips_cube_lut_get_shaper_size(const VipsCubeLUT *lut);
+VIPS_API
+void vips_cube_lut_apply(const VipsCubeLUT *lut,
+	float r, float g, float b,
+	float *out_r, float *out_g, float *out_b);
+
+VIPS_API
+int vips_cubelut(VipsImage *in, VipsImage **out, ...)
+	G_GNUC_NULL_TERMINATED;
+
 #ifdef __cplusplus
 }
 #endif /*__cplusplus*/

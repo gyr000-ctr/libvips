@@ -138,6 +138,8 @@ The colour spaces supported by libvips are:
 * [method@Image.UHDR2scRGB]
 * [method@Image.CICP2scRGB]
 * [ctor@Blob.profile_load]
+* [method@Image.cubelut]
+* [ctor@CubeLUT.new]
 * [func@icc_present]
 * [method@Image.icc_transform]
 * [method@Image.icc_import]
@@ -171,6 +173,18 @@ The colour spaces supported by libvips are:
 * [func@col_scRGB2BW_8]
 * [func@pythagoras]
 * [func@col_dE00]
+* [method@CubeLUT.load_file]
+* [method@CubeLUT.load_buffer]
+* [method@CubeLUT.apply]
+* [method@CubeLUT.get_title]
+* [method@CubeLUT.get_size]
+* [method@CubeLUT.get_shaper_size]
+* [method@CubeLUT.ref]
+* [method@CubeLUT.unref]
+
+## Types
+
+* [struct@CubeLUT]
 
 ## Constants
 
@@ -204,11 +218,14 @@ The colour spaces supported by libvips are:
 * [const@D3250_X0]
 * [const@D3250_Y0]
 * [const@D3250_Z0]
+* [const@CUBE_LUT_MAX_SIZE]
+* [const@CUBE_LUT_MAX_SHAPER_SIZE]
 
 ## Enumerations
 
 * [enum@CICPColourPrimaries]
 * [enum@CICPTransferCharacteristics]
 * [enum@CICPMatrixCoefficients]
+* [enum@CubeLUTError]
 * [enum@Intent]
 * [enum@PCS]

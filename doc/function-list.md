@@ -105,6 +105,7 @@ API docs each function links to for more details.
 | `convsep` | Separable convolution operation | [method@Image.convsep] |
 | `copy` | Copy an image | [method@Image.copy] |
 | `countlines` | Count lines in an image | [method@Image.countlines] |
+| `cubelut` | Apply a .cube 3D LUT to an image | [method@Image.cubelut] |
 | `csvload` | Load csv | [ctor@Image.csvload] |
 | `csvload_source` | Load csv | [ctor@Image.csvload_source] |
 | `csvsave` | Save image to csv | [method@Image.csvsave] |
